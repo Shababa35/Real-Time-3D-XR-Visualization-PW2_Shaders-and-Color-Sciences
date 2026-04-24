@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Shader-Driven Color Visualization</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+    </style>
+    <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.183.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.183.0/examples/jsm/"
+      }
+    }
+    </script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+let scene, camera, renderer, controls, video, videoTexture, colorSpaceMaterial;
+
+const params = {
+    colorSpace: 0,
+    pointSize: 2.2
+};
+
+const vertexShader = `
+    uniform sampler2D uTexture;
+    uniform int uColorSpace;
+    uniform float uPointSize;
+    uniform bool uIsDense;
+    varying vec3 vColor;
+
+    // 3.1 sRGB to Linear RGB
+    float srgb2lin(float c) {
+        return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+    }
+
+    // 3.2 Linear RGB to CIE XYZ
+    vec3 rgb2xyz(vec3 c) {
+        vec3 lin = vec3(srgb2lin(c.r), srgb2lin(c.g), srgb2lin(c.b));
+        return mat3(
+            0.4124564, 0.2126729, 0.0193339,
+            0.3575761, 0.7151522, 0.1191920,
+            0.1804375, 0.0721750, 0.9503041
+        ) * lin;
+    }
+
+    // 3.4 & 3.5 LAB Helper function f(t)
+    float f_t(float t) {
+        float delta = 6.0/29.0;
+        return (t > pow(delta, 3.0)) ? pow(t, 1.0/3.0) : (t / (3.0 * pow(delta, 2.0))) + (4.0/29.0);
+    }
+
+    // 3.6 RGB to HSV
+    vec3 rgb2hsv(vec3 rgb) {
+        float r = rgb.r, g = rgb.g, b = rgb.b;
+        float cMax = max(r, max(g, b));
+        float cMin = min(r, min(g, b));
+        float delta = cMax - cMin;
+        float v = cMax;
+        float s = (cMax == 0.0) ? 0.0 : delta / cMax;
+        float h = 0.0;
+        if (delta > 0.0) {
+            if (cMax == r) h = 60.0 * mod(((g - b) / delta), 6.0);
+            else if (cMax == g) h = 60.0 * (((b - r) / delta) + 2.0);
+            else if (cMax == b) h = 60.0 * (((r - g) / delta) + 4.0);
+        }
+        return vec3(h / 360.0, s, v); 
+    }
+
+    void main() {
+        vec3 rgb = texture2D(uTexture, uv).rgb;
+        vColor = rgb;
+        vec3 pos;
+
+        if (uIsDense) {
+            // Dense Cloud Logic: Spatial Grid + Luminance
+            pos = vec3(position.xy, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+        } else {
+            if (uColorSpace == 0) { // RGB
+                pos = rgb;
+            } else if (uColorSpace == 1) { // HSV
+                pos = rgb2hsv(rgb);
+            } else if (uColorSpace == 2) { // CIEXYZ
+                pos = rgb2xyz(rgb);
+            } else if (uColorSpace == 3) { // CIExyY
+                vec3 xyz = rgb2xyz(rgb);
+                float sum = xyz.x + xyz.y + xyz.z;
+                pos = (sum > 0.0) ? vec3(xyz.x/sum, xyz.y/sum, xyz.y) : vec3(0.0);
+            } else if (uColorSpace == 4) { // CIELAB
+                vec3 xyz = rgb2xyz(rgb);
+                vec3 n = vec3(0.95047, 1.00000, 1.08883); 
+                float fX = f_t(xyz.x / n.x), fY = f_t(xyz.y / n.y), fZ = f_t(xyz.z / n.z);
+                float L = 116.0 * fY - 16.0, a = 500.0 * (fX - fY), b = 200.0 * (fY - fZ);
+                pos = vec3((a + 128.0) / 256.0, (b + 128.0) / 256.0, L / 100.0);
+            } else { // CIELCH
+                vec3 xyz = rgb2xyz(rgb);
+                vec3 n = vec3(0.95047, 1.00000, 1.08883);
+                float fX = f_t(xyz.x / n.x), fY = f_t(xyz.y / n.y), fZ = f_t(xyz.z / n.z);
+                float L = 116.0 * fY - 16.0, a = 500.0 * (fX - fY), b = 200.0 * (fY - fZ);
+                float C = sqrt(a*a + b*b);
+                float h = atan(b, a); // atan(y, x) is atan2
+                pos = vec3(C / 128.0, h / 6.2831 + 0.5, L / 100.0);
+            }
+        }
+
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+        gl_PointSize = uPointSize;
+    }
+`;
+
+const fragmentShader = `
+    varying vec3 vColor;
+    void main() {
+        if (length(gl_PointCoord - 0.5) > 0.5) discard;
+        gl_FragColor = vec4(vColor, 1.0);
+    }
+`;
+
+init();
+
+function init() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 50);
+    camera.position.set(1.5, 1.5, 4);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(1.25, 0.5, 0.5);
+
+    // Box Containers
+    const createContainer = (x) => {
+        const box = new THREE.LineSegments(
+            new THREE.WireframeGeometry(new THREE.BoxGeometry(1, 1, 1)),
+            new THREE.LineBasicMaterial({ color: 0x444444 })
+        );
+        box.position.set(x + 0.5, 0.5, 0.5);
+        scene.add(box);
+    };
+    // createContainer(0.5); 
+    createContainer(2.0); 
+
+    video = document.createElement('video');
+    video.src = 'video.mp4'; 
+    video.loop = true; video.muted = true; video.playsInline = true; video.crossOrigin = "anonymous";
+
+    video.onloadeddata = () => {
+        videoTexture = new THREE.VideoTexture(video);
+
+        // Plane
+        const plane = new THREE.Mesh(
+            new THREE.PlaneGeometry(2.5, 2.5 * (video.videoHeight / video.videoWidth)),
+            new THREE.MeshBasicMaterial({ map: videoTexture })
+        );
+        plane.position.set(0.1, 0.5, 0.5);
+        scene.add(plane);
+
+        const width = 128, height = 72, count = width * height;
+        const uvs = new Float32Array(count * 2);
+        const gridPos = new Float32Array(count * 3);
+        for (let i = 0; i < count; i++) {
+            uvs[i * 2] = (i % width) / (width - 1);
+            uvs[i * 2 + 1] = Math.floor(i / width) / (height - 1);
+            gridPos[i * 3] = uvs[i * 2];
+            gridPos[i * 3 + 1] = uvs[i * 2 + 1];
+            gridPos[i * 3 + 2] = 0;
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+
+
+
+        // Point Cloud Distribution
+        colorSpaceMaterial = new THREE.ShaderMaterial({
+            uniforms: { uTexture: { value: videoTexture }, uPointSize: { value: params.pointSize }, uIsDense: { value: false }, uColorSpace: { value: 0 } },
+            vertexShader, fragmentShader
+        });
+        const cCloud = new THREE.Points(geo.clone(), colorSpaceMaterial);
+        cCloud.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+        cCloud.position.x = 2.0;
+        scene.add(cCloud);
+
+        // GUI
+        const gui = new GUI();
+
+           gui.add(params, 'colorSpace', { RGB: 0, HSV: 1, CIEXYZ: 2, CIExyY: 3, CIELAB: 4, CIELCH: 5 })
+   .name('Target Space')
+   .onChange(v => { 
+       const spaceID = parseInt(v);
+       
+       colorSpaceMaterial.uniforms.uColorSpace.value = spaceID; 
+       
+       denseMat.uniforms.uColorSpace.value = spaceID;})
+
+        video.play();
+    };
+
+    animate();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if (controls) controls.update();
+    renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
